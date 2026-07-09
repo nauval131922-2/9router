@@ -1,0 +1,74 @@
+name: Deploy 9router to VPS
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Remove build cache before deploy
+        run: rm -rf .next/cache
+
+      - name: Copy build to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: .next/
+          target: /var/www/9router/.next-tmp/
+          strip_components: 0
+
+      - name: Swap .next and restart PM2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /var/www/9router
+
+            if [ ! -d ".next-tmp/.next" ] || [ ! -f ".next-tmp/.next/BUILD_ID" ]; then
+              echo "No valid build in .next-tmp/.next"
+              rm -rf .next-tmp 2>/dev/null
+              exit 1
+            fi
+
+            pm2 stop 9router
+            rm -rf .next.bak
+            [ -d ".next" ] && mv .next .next.bak
+            rm -rf .next 2>/dev/null || true
+            mv .next-tmp/.next .next
+            rmdir .next-tmp 2>/dev/null
+            pm2 start 9router
+            sleep 5
+
+            for i in $(seq 1 20); do
+              sleep 1
+              code=$(curl -s -o /dev/null -w "%{http_code}" -m 2 http://localhost:20128/ 2>/dev/null || true)
+              if [ "$code" = "200" ] || [ "$code" = "307" ]; then
+                rm -rf .next.bak 2>/dev/null
+                echo "Health OK"
+                exit 0
+              fi
+            done
+
+            echo "Health FAILED - rolling back"
+            rm -rf .next-failed 2>/dev/null
+            mv .next .next-failed
+            if [ -d ".next.bak" ]; then
+              mv .next.bak .next
+            fi
+            pm2 start 9router
+            exit 1
